@@ -362,6 +362,13 @@ void frame_origin() {
 
 static std::atomic<uint64_t> g_cull_eval{0}, g_cull_hidden{0};
 
+struct MeshBoundsSlot {
+    uint64_t mesh = 0;
+    uint64_t node = 0;
+    uint32_t stamp = 0;
+    float cx = 0.0f, cy = 0.0f, cz = 0.0f, radius = 0.0f;
+};
+
 void interval_setter_hook(CPU& c) {
     scan_tasks();
     const uint64_t period = game_clock();
@@ -400,8 +407,12 @@ void interval_setter_hook(CPU& c) {
         last_cull_eval = ev;
         last_cull_hidden = hd;
         if (d_ev > 0) {
-            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%) over 300 frames",
-                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev));
+            static const float s_log_scale = [] {
+                const char* e = std::getenv("NX_P5R_DIST_SCALE");
+                return e ? std::clamp(float(std::atof(e)), 0.5f, 3.0f) : 1.0f;
+            }();
+            log("p5r: distance culling: %llu of %llu visible meshes culled (%.1f%%, scale %.2fx) over 300 frames",
+                (unsigned long long)d_hd, (unsigned long long)d_ev, 100.0 * double(d_hd) / double(d_ev), s_log_scale);
         }
     }
 }
@@ -479,6 +490,11 @@ void cull_job_hook(CPU& c) {
         const char* e = std::getenv("NX_P5R_DIST_CULL");
         return !(e && e[0] == '0');
     }();
+    static const float dist_cull_scale = [] {
+        const char* e = std::getenv("NX_P5R_DIST_SCALE");
+        if (e) return std::clamp(float(std::atof(e)), 0.5f, 3.0f);
+        return 1.0f;  // Default 1.0x for lowend-r50 proven distance curve
+    }();
 
     if (dist_cull_on && after.ptr) {
         const int n = int(ld<uint32_t>(list + 8));
@@ -487,8 +503,12 @@ void cull_job_hook(CPU& c) {
         if (arr && sarr && stride > 0 && sstride > 0) {
             const float* p = after.p[0];  // Near plane normal (p[0], p[1], p[2]) and distance (p[3])
             const uint64_t box = (sp - 0x200) & ~uint64_t(15);
+            thread_local MeshBoundsSlot tl_bounds_cache[4096];
+            const uint64_t cur_p = nvn::presents_recorded();
+            const uint32_t cur_stamp = uint32_t(cur_p >> 4) + 1u;  // refreshes every 16 frames
             uint64_t last_node = 0;
             uint64_t last_matrix = 0;
+
             for (int i = 0; i < n && i < 1024; i++) {
                 const uint64_t mesh = ld<uint64_t>(arr + stride * i);
                 if (!mesh) continue;
@@ -499,53 +519,50 @@ void cull_job_hook(CPU& c) {
                 const uint64_t local_bounds = mesh + 0x90;
                 if (!node || !local_bounds) continue;
 
-                CPU scratch = c;
-                scratch.x[31] = sp;
-                uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
-                if (!matrix) continue;
-                last_node = node;
-                last_matrix = matrix;
-                guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
+                MeshBoundsSlot& slot = tl_bounds_cache[((mesh >> 5) ^ (mesh >> 17)) & 4095];
+                float b0, b1, b2, radius;
+                if (slot.mesh == mesh && slot.node == node && slot.stamp == cur_stamp) {
+                    b0 = slot.cx;
+                    b1 = slot.cy;
+                    b2 = slot.cz;
+                    radius = slot.radius;
+                } else {
+                    CPU scratch = c;
+                    scratch.x[31] = sp;
+                    uint64_t matrix = (node == last_node) ? last_matrix : guest_fn(scratch, 0xfa9460, node);
+                    if (!matrix) continue;
+                    last_node = node;
+                    last_matrix = matrix;
+                    guest_fn(scratch, 0xa92c80, box, local_bounds, matrix);
 
-                // Direct load center coordinates (b[0..2])
-                const float b0 = ld<float>(box);
-                const float b1 = ld<float>(box + 4);
-                const float b2 = ld<float>(box + 8);
+                    b0 = ld<float>(box);
+                    b1 = ld<float>(box + 4);
+                    b2 = ld<float>(box + 8);
+                    const float r16 = std::fabs(ld<float>(box + 16 * 4));
+                    const float r17 = std::fabs(ld<float>(box + 17 * 4));
+                    const float r18 = std::fabs(ld<float>(box + 18 * 4));
+                    if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
+                    radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
+                    slot = {mesh, node, cur_stamp, b0, b1, b2, radius};
+                }
 
                 // Signed distance of box center from near plane along camera view axis
                 const float view_dist = p[0] * b0 + p[1] * b1 + p[2] * b2 - p[3];
-                if (!std::isfinite(view_dist) || view_dist <= 2.5f) continue;  // Protect immediate player interaction bubble
+                if (!std::isfinite(view_dist) || view_dist <= 12.0f) continue;  // Protect indoor rooms & 12m player bubble
 
-                // Direct load half-extents (b[16..18])
-                const float r16 = std::fabs(ld<float>(box + 16 * 4));
-                const float r17 = std::fabs(ld<float>(box + 17 * 4));
-                const float r18 = std::fabs(ld<float>(box + 18 * 4));
-                if (!std::isfinite(r16) || !std::isfinite(r17) || !std::isfinite(r18)) continue;
-                const float radius = std::sqrt(r16 * r16 + r17 * r17 + r18 * r18);
+                // Hard structural ceiling: never cull large structural geometry (walls, floors, ceilings)
+                if (radius >= 8.0f) continue;
 
                 g_cull_eval.fetch_add(1, std::memory_order_relaxed);
 
-                // Progressive tiered small-object / clutter distance culling:
-                // Money bundles & small clutter boxes on vault shelves have radius ~0.15m - 0.35m.
-                // Steel rack frames have radius > 2.5m, walls/floors > 8.0m, characters > 1.0m.
-                bool cull = false;
                 const float ratio = radius / view_dist;
-
-                if (view_dist < 5.0f) {
-                    // Very close (2.5m - 5m): Only cull tiny sub-decimeter clutter
-                    if (radius < 0.08f) cull = true;
-                } else if (view_dist < 10.0f) {
-                    // Close (5m - 10m): Cull small shelf boxes (e.g. money stacks on the next rack row)
-                    if (radius < 0.28f || ratio < 0.022f) cull = true;
-                } else if (view_dist < 20.0f) {
-                    // Medium (10m - 20m): Cull props and clutter on shelves 2-3 rows back
-                    if (radius < 0.45f || ratio < 0.025f) cull = true;
+                bool cull = false;
+                if (view_dist < 20.0f) {
+                    if (radius < 0.45f * dist_cull_scale || ratio < 0.025f * dist_cull_scale) cull = true;
                 } else if (view_dist < 40.0f) {
-                    // Far (20m - 40m): Cull clutter on shelves across the room (e.g. from stairs)
-                    if (radius < 0.85f || ratio < 0.025f) cull = true;
+                    if (radius < 0.85f * dist_cull_scale || ratio < 0.025f * dist_cull_scale) cull = true;
                 } else {
-                    // Very far (> 40m): Cull anything under 2.0m across large vault halls
-                    if (radius < 2.0f || ratio < 0.030f) cull = true;
+                    if (radius < 2.0f * dist_cull_scale || ratio < 0.030f * dist_cull_scale) cull = true;
                 }
 
                 if (cull) {
@@ -693,12 +710,12 @@ void game::after_init() {
         log("p5r: nnMain or the frame interval setter not found: the game's own 30 fps");
     }
 }
-static constexpr const char* kPerfBuildTag = "lowend-r50";
+static constexpr const char* kPerfBuildTag = "renderopt-r61";
 
 void game::renderer_start() {
     static std::atomic<bool> started{false};
     if (started.exchange(true)) return;
-    log("p5r perf build: %s (hoisted draw statics, stencil dedup, optimized MRU pipeline cache)",
+    log("p5r perf build: %s (world-bounds cache, 12m indoor safe bubble, lowend-r50 brackets)",
         kPerfBuildTag);
 #if defined(__ANDROID__)
     // Low-end Android defaults:

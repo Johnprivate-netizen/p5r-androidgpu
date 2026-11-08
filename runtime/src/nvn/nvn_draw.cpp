@@ -231,6 +231,11 @@ void pass_census(const Targets& t, const VkRenderingAttachmentInfo* colors, cons
     e.passes++, e.load += load, e.store += store;
 }
 
+static const bool s_shadows_off = [] {
+    const char* e = std::getenv("NX_SHADOWS");
+    return e && e[0] == '0';
+}();
+
 void begin_rendering(VkCommandBuffer cb, const Targets& t) {
     if (clears_pending_other(t)) {  // other targets' clears first, in order (NX_CLEARS_V2: only those on its images)
         if (live_clears_why()) clears_log_mismatch("pass", t);
@@ -344,9 +349,13 @@ uint64_t g_dump_draws = 0, g_dump_request = 0;
 
 // The graphics stages bound now: one program for all of them (its own list), or a vertex and a fragment program
 // bound separately (their stages gathered in `out`).
+uint64_t g_bound_pv = 0, g_bound_pf = 0, g_bound_serial = 0;
 const std::vector<const ShaderInfo*>* bound_graphics_shaders(std::vector<const ShaderInfo*>& out) {
     const uint64_t pv = g_state.stage_programs[0], pf = g_state.stage_programs[1];
+    if (!pv && !pf) return nullptr;
     if (pv == pf) return program_shaders(pv);
+    if (t_replay_serial && g_bound_serial == t_replay_serial && g_bound_pv == pv && g_bound_pf == pf && !out.empty())
+        return &out;
     out.clear();
     if (const auto* sh = program_shaders(pv))
         for (const ShaderInfo* s : *sh)
@@ -354,7 +363,13 @@ const std::vector<const ShaderInfo*>* bound_graphics_shaders(std::vector<const S
     if (const auto* sh = program_shaders(pf))
         for (const ShaderInfo* s : *sh)
             if (s->stage == ShaderStage::Fragment) out.push_back(s);
+    g_bound_pv = pv, g_bound_pf = pf, g_bound_serial = t_replay_serial;
     return &out;
+}
+
+std::vector<const ShaderInfo*> g_bound_shaders;
+const std::vector<const ShaderInfo*>* bound_shaders() {
+    return bound_graphics_shaders(g_bound_shaders);
 }
 
 // DispatchCompute: the bound program's compute stage over (x, y, z) groups, outside render passes, then a barrier
@@ -421,11 +436,6 @@ void vertex_read_barrier(VkCommandBuffer cb, const ShaderInfo* vs) {
                            nullptr, 0, nullptr);
     g_vertex_pending = false, g_vertex_barriers++, g_vertex_visible_at = g_pass_serial;
 }
-
-static const bool s_shadows_off = [] {
-    const char* e = std::getenv("NX_SHADOWS");
-    return e && e[0] == '0';
-}();
 
 // NX_SHADOWS=0 (the launcher's "Sombras: desactivadas"): no draws into shadow maps, the square depth-only targets of
 // 512 or more (P5R: 2048 and 1024, D32). Their clears stay: the maps say "lit" everywhere.
@@ -941,8 +951,35 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
 
     VkPipeline pipeline = VK_NULL_HANDLE;
 
-    // Pipeline.
-    PipelineKey key;
+    // Fast-path bypass: if consecutive draws share the same shader programs, topology,
+    // pipeline state generation, layout, and render targets, reuse the bound graphics pipeline directly.
+    // This avoids a 704-byte memset, array copies, target format lookups, and 704-byte memcmp MRU searches.
+    static const ShaderInfo* s_cached_pipe_vs = nullptr;
+    static const ShaderInfo* s_cached_pipe_fs = nullptr;
+    static uint32_t s_cached_pipe_mode = 0;
+    static bool s_cached_pipe_indexed = false;
+    static VkPipelineLayout s_cached_pipe_layout = VK_NULL_HANDLE;
+    static uint32_t s_cached_pipe_state_version = 0;
+    static bool s_cached_pipe_textures_empty = false;
+    static VkPipeline s_cached_fast_pipeline = VK_NULL_HANDLE;
+
+    if (g_bound.pipeline != VK_NULL_HANDLE &&
+        g_bound.cb == cb &&
+        s_cached_fast_pipeline == g_bound.pipeline &&
+        vs == s_cached_pipe_vs &&
+        fs == s_cached_pipe_fs &&
+        mode == s_cached_pipe_mode &&
+        indexed == s_cached_pipe_indexed &&
+        layout.layout == s_cached_pipe_layout &&
+        replay::g_pipeline_state_version == s_cached_pipe_state_version &&
+        !targets_changed &&
+        g_textures.bindings.empty() == s_cached_pipe_textures_empty &&
+        !uw_on() &&
+        !live_flags()) {
+        pipeline = s_cached_fast_pipeline;
+    } else {
+        // Pipeline.
+        PipelineKey key;
         std::memset(&key, 0, sizeof key);  // the key is compared byte for byte
         key.vs = vs, key.fs = fs;
         key.topology = mode;
@@ -1073,6 +1110,17 @@ bool draw(VkCommandBuffer cb, const Targets& t, uint32_t mode, bool indexed, con
                 s_mru_order[0] = insert_idx;
             }
         }
+        if (pipeline != VK_NULL_HANDLE) {
+            s_cached_pipe_vs = vs;
+            s_cached_pipe_fs = fs;
+            s_cached_pipe_mode = mode;
+            s_cached_pipe_indexed = indexed;
+            s_cached_pipe_layout = layout.layout;
+            s_cached_pipe_state_version = replay::g_pipeline_state_version;
+            s_cached_pipe_textures_empty = g_textures.bindings.empty();
+            s_cached_fast_pipeline = pipeline;
+        }
+    }
     if (!pipeline) {
         g_stats.no_pipeline++;
         return false;
@@ -1320,6 +1368,7 @@ std::vector<WriteBack> draw_take_write_backs() {  // an asynchronous submit copi
 }
 
 void draw_begin_submit() {
+    g_bound_serial = 0;
     g_rendering = false;
     g_linear_targets.clear(), g_late_write_backs.clear();
     g_vertex_pending = false, g_vertex_visible_at = g_pass_serial;  // each command buffer begins with a full barrier

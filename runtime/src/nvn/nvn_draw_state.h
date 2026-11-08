@@ -58,6 +58,8 @@ struct Stats {
 
 extern State g_state;
 extern Stats g_stats;
+extern uint32_t g_pipeline_state_version;
+extern uint32_t g_attrib_state_version;
 extern bool g_hud_target;  // NX_HUD_1080: this draw's target is a 1920x1080 image of a 1280x720 texture (nvn_vk.h)
 extern bool g_low_3d_target;  // NX_LOW_3D: this draw's target is a 720x405 image of a 960x540 texture (nvn_vk.h)
 
@@ -102,7 +104,11 @@ void cache_begin_submit();  // frees the copies retired submits read
 void cache_log();
 void dedup_reset();                                     // at each submit
 void dedup_invalidate(const uint8_t* p, uint64_t size);  // guest bytes written during the replay
+uint64_t dedup_generation();
+uint64_t dedup_inval_epoch();
 void dedup_log();
+void stream_cache_invalidate(const uint8_t* p, uint64_t size);
+void index_cache_invalidate(const uint8_t* p, uint64_t size);
 // nvn_written.cpp: compute results within a submit (docs/nvn/GLITCH-PLAN.md G5), one copy per written guest range.
 bool written_separate();  // NX_COMPUTE_SEPARATE=1: a copy per binding, as before
 // A dispatch's storage binding it writes: the range's copy (made, reused or merged), kAlign aligned.

@@ -69,6 +69,7 @@ struct Entry {
     uint32_t size_class = 0;  // the allocation: one slot of that class
     uint64_t serial = 0;             // the last submit that bound it (frees wait for it to retire)
     uint64_t seen = 0;               // g_submits then (copies unbound for kStaleSubmits are freed)
+    uint64_t last_verified_submit = 0;  // the last submit that hashed guest memory
 };
 std::unordered_map<const uint8_t*, Entry> g_entries;
 
@@ -203,13 +204,27 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     // Check if this buffer is already cached
     auto it = g_entries.find(p);
     if (it != g_entries.end()) {
+        Entry& e = it->second;
+        // Fast path: if already backed by a VkBuffer and verified in this exact submit, skip re-hashing guest RAM.
+        if (e.size == size && e.padded == padded && e.block < g_blocks.size() && g_blocks[e.block].buffer != VK_NULL_HANDLE) {
+            const bool same_submit = (e.last_verified_submit == g_submits);
+            if (same_submit) {
+                e.serial = std::max(e.serial, frame_recording_serial());
+                e.seen = g_submits;
+                g_stats_cache.hits++;
+                g_stats_cache.hit_bytes += padded;
+                out = {g_blocks[e.block].buffer, e.offset, g_blocks[e.block].ptr + e.offset};
+                return true;
+            }
+        }
+
         const uint64_t t0 = time_hash ? plat::monotonic_ns() : 0;
         uint64_t h = hash_memory(p, size);  // whole 8-byte words: the last size % 8 bytes go in here
         for (uint64_t k = size & ~7ull; k < size; k++) h = (h ^ p[k]) * 0x100000001B3ull;
         if (time_hash) g_stats_cache.hash_ns += plat::monotonic_ns() - t0;
 
-        Entry& e = it->second;
         if (e.size == size && e.padded == padded && e.hash == h) {
+            e.last_verified_submit = g_submits;
             // NX_BUFFER_CACHE_VERIFY=1: every hit compared with the guest bytes (slow: the copy is uncached memory).
             static const bool verify = std::getenv("NX_BUFFER_CACHE_VERIFY") != nullptr;
             if (verify && std::memcmp(g_blocks[e.block].ptr + e.offset, p, size) != 0) {
@@ -268,7 +283,7 @@ bool cache_upload(const uint8_t* p, uint64_t size, uint64_t padded, uint64_t ali
     frame_guest_read(p, size);
     plat::fast_memcpy(dst, p, size);
     if (padded > size) std::memset(dst + size, 0, padded - size);
-    g_entries[p] = {size, padded, h, slot.block, slot.offset, c, serial, g_submits};
+    g_entries[p] = {size, padded, h, slot.block, slot.offset, c, serial, g_submits, g_submits};
     g_stats_cache.misses++, g_stats_cache.miss_bytes += padded;
     out = {g_blocks[slot.block].buffer, slot.offset, dst};
     return true;
