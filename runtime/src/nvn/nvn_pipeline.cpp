@@ -722,6 +722,12 @@ PipelineKey canonical_key(const PipelineKey& in) {
             // to back so both faces evaluate the identical stencil test and operations.
             if (in.polygon.cull == 0 || (k.depth.stencil_func[1] == 0 && k.depth.depth_pass[1] == 0) ||
                 (k.depth.depth_pass[1] <= 1 && k.depth.depth_pass[0] > 1)) {
+                static int s_mirror_count = 0;
+                if (s_mirror_count++ < 30) {
+                    log("nvn/vk: stencil front->back unified for pipeline vs %s fs %s (func=%u pass=%u cull=%u)",
+                        in.vs ? in.vs->hash.c_str() : "-", in.fs ? in.fs->hash.c_str() : "-",
+                        unsigned(k.depth.stencil_func[0]), unsigned(k.depth.depth_pass[0]), unsigned(in.polygon.cull));
+                }
                 k.depth.stencil_func[1] = k.depth.stencil_func[0];
                 k.depth.stencil_fail[1] = k.depth.stencil_fail[0];
                 k.depth.depth_fail[1]   = k.depth.depth_fail[0];

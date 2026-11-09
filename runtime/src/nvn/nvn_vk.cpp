@@ -348,7 +348,8 @@ bool init() {
         frame_init(g_pool, g_family, g_upload, g_upload_ptr, g_upload_size);  // the upload buffer: the slots' ring
     else
         g_descriptors = make_descriptor_pool();
-    log("nvn/vk: %s, Vulkan %u.%u, queue family %u", props.deviceName, VK_API_VERSION_MAJOR(props.apiVersion),
+    log("nvn/vk: %s (vendor %#x, driver %#x), Vulkan %u.%u, queue family %u", props.deviceName,
+        props.vendorID, props.driverVersion, VK_API_VERSION_MAJOR(props.apiVersion),
         VK_API_VERSION_MINOR(props.apiVersion), g_family);
     g_failed = false;
     g_ready = true;

@@ -90,8 +90,8 @@ bool native_d24s8() {
     VkFormatProperties fp{};
     p_vkGetPhysicalDeviceFormatProperties(vk_physical(), VK_FORMAT_D24_UNORM_S8_UINT, &fp);
     const bool on = wanted && (fp.optimalTilingFeatures & need) == need;
-    if (wanted) log("nvn/vk: D24S8 %s (format features %#x)", on ? "native (D24_UNORM_S8_UINT)" : "as D32S8",
-                    unsigned(fp.optimalTilingFeatures));
+    log("nvn/vk: D24S8 %s (optimal tiling features %#x, requested %s)", on ? "native (D24_UNORM_S8_UINT)" : "as D32S8",
+        unsigned(fp.optimalTilingFeatures), wanted ? "yes" : "no");
     state.store(on ? 1 : 0, std::memory_order_release);
     return on;
 }

@@ -52,11 +52,12 @@ thread_local const char* t_missing_name = nullptr;
 
 void log(const char* fmt, ...) {
 #if defined(__ANDROID__)
-    // Low-end build: disable runtime logging by default to eliminate logcat IPC, formatting, and file I/O overhead.
-    // Set NX_ENABLE_LOG=1 to enable logging for debugging.
+    // Diagnostic build: runtime logging enabled by default to capture engine/GPU diagnostics.
+    // Set NX_ENABLE_LOG=0 to disable logging.
     static const bool s_enabled = [] {
         const char* e = std::getenv("NX_ENABLE_LOG");
-        return e && (e[0] == '1' || std::strcmp(e, "true") == 0);
+        if (!e) return true;
+        return e[0] != '0' && std::strcmp(e, "false") != 0;
     }();
     if (!s_enabled) return;
 #endif
